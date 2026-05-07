@@ -1,0 +1,79 @@
+pipeline {
+    agent { label 'spoke-linux' }
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        AMI_NAME_PREFIX    = 'nginx-production-ami'
+        EMAIL_RECIPIENT    = 'devops-team@example.com'
+    }
+
+    stages {
+        stage('Cleanup & Prepare') {
+            steps {
+                echo "Cleaning up..."
+                sh 'rm -f manifest.json'
+            }
+        }
+
+        stage('AWS Key Pair Preparation') {
+            steps {
+                echo "Generating temporary AWS Key Pair..."
+                sh '''
+                KEY_NAME="packer-temp-key-${BUILD_NUMBER}"
+                aws ec2 create-key-pair --key-name ${KEY_NAME} --query 'KeyMaterial' --output text > packer_key.pem
+                chmod 400 packer_key.pem
+                '''
+            }
+        }
+
+        stage('Packer Build') {
+            steps {
+                echo "Initializing Packer..."
+                sh 'packer init aws-ami.pkr.hcl'
+                echo "Running Packer build..."
+                sh 'packer build -machine-readable aws-ami.pkr.hcl | tee packer_output.txt'
+            }
+        }
+
+        stage('Extract AMI ID') {
+            steps {
+                script {
+                    def amiId = sh(script: "grep 'artifact,0,id' packer_output.txt | cut -d, -f6 | cut -d: -f2", returnStdout: true).trim()
+                    env.NEW_AMI_ID = amiId
+                    echo "Newly created AMI ID: ${env.NEW_AMI_ID}"
+                }
+            }
+        }
+
+        stage('Store Keys') {
+            steps {
+                echo "Storing keys..."
+                sh '''
+                aws secretsmanager create-secret --name "jenkins/keys/aws-${BUILD_NUMBER}" --secret-string file://packer_key.pem || \
+                aws secretsmanager put-secret-value --secret-id "jenkins/keys/aws-${BUILD_NUMBER}" --secret-string file://packer_key.pem
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            emailext (
+                to: "${EMAIL_RECIPIENT}",
+                subject: "SUCCESS: New AMI Created - ${env.NEW_AMI_ID}",
+                body: "A new AMI has been successfully created.\n\nAMI ID: ${env.NEW_AMI_ID}\nBuild Number: ${BUILD_NUMBER}\nPipeline: ${JOB_NAME}"
+            )
+            sh 'aws ec2 delete-key-pair --key-name packer-temp-key-${BUILD_NUMBER}'
+            sh 'rm -f packer_key.pem packer_output.txt'
+        }
+        failure {
+            emailext (
+                to: "${EMAIL_RECIPIENT}",
+                subject: "FAILURE: AMI Creation Failed",
+                body: "The AMI creation pipeline failed.\n\nCheck Jenkins console output for details: ${BUILD_URL}"
+            )
+            sh 'aws ec2 delete-key-pair --key-name packer-temp-key-${BUILD_NUMBER} || true'
+            sh 'rm -f packer_key.pem packer_output.txt'
+        }
+    }
+}

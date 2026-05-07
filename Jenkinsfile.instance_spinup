@@ -1,0 +1,103 @@
+pipeline {
+    agent { label 'spoke-linux' }
+
+    parameters {
+        choice(name: 'ACTION', choices: ['START', 'STOP'], description: 'Choose whether to START or STOP a VM instance')
+        string(name: 'AMI_ID', defaultValue: '', description: 'AMI ID to use for START (leave blank to find latest)')
+        string(name: 'INSTANCE_ID', defaultValue: '', description: 'Instance ID to STOP')
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        SG_NAME            = 'production-web-sg'
+        EMAIL_RECIPIENT    = 'devops-team@example.com'
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                echo "Action selected: ${params.ACTION}"
+            }
+        }
+
+        stage('Manage Infrastructure (START)') {
+            when {
+                expression { params.ACTION == 'START' }
+            }
+            steps {
+                script {
+                    echo "Setting up Security Group..."
+                    sh '''
+                    if ! aws ec2 describe-security-groups --group-names ${SG_NAME} > /dev/null 2>&1; then
+                        aws ec2 create-security-group --group-name ${SG_NAME} --description "SG for Production Web"
+                        aws ec2 authorize-security-group-ingress --group-name ${SG_NAME} --protocol tcp --port 22 --cidr 0.0.0.0/0
+                        aws ec2 authorize-security-group-ingress --group-name ${SG_NAME} --protocol tcp --port 80 --cidr 0.0.0.0/0
+                    fi
+                    '''
+
+                    def targetAmi = params.AMI_ID
+                    if (targetAmi == '') {
+                        echo "Finding latest AMI..."
+                        targetAmi = sh(script: "aws ec2 describe-images --owners self --filters 'Name=name,Values=nginx-production-ami-*' --query 'sort_by(Images, &CreationDate)[-1].ImageId' --output text", returnStdout: true).trim()
+                    }
+                    
+                    if (targetAmi == 'None' || targetAmi == '') {
+                        error "No AMI found to launch!"
+                    }
+                    
+                    echo "Launching instance with AMI: ${targetAmi}"
+                    def instanceId = sh(script: "aws ec2 run-instances --image-id ${targetAmi} --count 1 --instance-type t2.micro --security-groups ${SG_NAME} --query 'Instances[0].InstanceId' --output text", returnStdout: true).trim()
+                    env.NEW_INSTANCE_ID = instanceId
+                    
+                    echo "Waiting for instance to receive Public IP..."
+                    sh "aws ec2 wait instance-running --instance-ids ${env.NEW_INSTANCE_ID}"
+                    def publicIp = sh(script: "aws ec2 describe-instances --instance-ids ${env.NEW_INSTANCE_ID} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text", returnStdout: true).trim()
+                    env.PUBLIC_IP = publicIp
+                }
+            }
+        }
+
+        stage('Manage Infrastructure (STOP)') {
+            when {
+                expression { params.ACTION == 'STOP' }
+            }
+            steps {
+                script {
+                    if (params.INSTANCE_ID == '') {
+                        error "INSTANCE_ID is required for STOP action!"
+                    }
+                    echo "Stopping instance: ${params.INSTANCE_ID}"
+                    sh "aws ec2 stop-instances --instance-ids ${params.INSTANCE_ID}"
+                    sh "aws ec2 wait instance-stopped --instance-ids ${params.INSTANCE_ID}"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (params.ACTION == 'START') {
+                    emailext (
+                        to: "${EMAIL_RECIPIENT}",
+                        subject: "SUCCESS: Production Instance UP - ${env.NEW_INSTANCE_ID}",
+                        body: "Production instance is now online.\n\nInstance ID: ${env.NEW_INSTANCE_ID}\nPublic IP: ${env.PUBLIC_IP}\nURL: http://${env.PUBLIC_IP}"
+                    )
+                } else {
+                    emailext (
+                        to: "${EMAIL_RECIPIENT}",
+                        subject: "SUCCESS: Production Instance STOPPED - ${params.INSTANCE_ID}",
+                        body: "Instance ${params.INSTANCE_ID} has been successfully stopped."
+                    )
+                }
+            }
+        }
+        failure {
+            emailext (
+                to: "${EMAIL_RECIPIENT}",
+                subject: "FAILURE: Instance Management Failed",
+                body: "The instance management pipeline failed.\n\nAction: ${params.ACTION}\nCheck Jenkins console output for details: ${BUILD_URL}"
+            )
+        }
+    }
+}
