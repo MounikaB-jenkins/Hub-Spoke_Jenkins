@@ -1,5 +1,5 @@
 pipeline {
-    agent { label 'spoke-linux' }
+    agent any
 
     environment {
         AWS_DEFAULT_REGION = 'us-east-1'
